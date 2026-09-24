@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#2f6fde">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="To-Do">
+  <title>Shared To-Do</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icon.svg">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <!-- Sign in / create account -->
+  <main id="auth-view" class="auth" hidden>
+    <form id="auth-form" class="card auth-card" novalidate>
+      <h1>Shared To-Do</h1>
+      <p class="muted">Lists with notes, photos, deadlines and reminders, shared only with the people you choose.</p>
+      <label>Username
+        <input name="username" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" required minlength="3" maxlength="32">
+      </label>
+      <label>Password
+        <input name="password" type="password" autocomplete="current-password" required minlength="8">
+      </label>
+      <p id="auth-error" class="error" role="alert"></p>
+      <div class="row">
+        <button type="submit" class="primary" data-mode="login">Sign in</button>
+        <button type="submit" data-mode="register">Create account</button>
+      </div>
+    </form>
+  </main>
+
+  <!-- Main app -->
+  <div id="app-view" class="app" hidden>
+    <header class="topbar">
+      <button id="menu-btn" class="ghost menu-btn" aria-label="Show lists" aria-expanded="false">☰</button>
+      <strong class="brand">Shared To-Do</strong>
+      <span class="spacer"></span>
+      <span id="whoami" class="muted"></span>
+      <button id="logout-btn" class="ghost">Sign out</button>
+    </header>
+
+    <aside class="sidebar" id="sidebar">
+      <form id="new-list-form" class="row">
+        <input name="title" placeholder="New list name" maxlength="120" required aria-label="New list name">
+        <button class="primary" type="submit">Add</button>
+      </form>
+      <nav id="lists-nav" aria-label="Your lists"></nav>
+      <div id="notify-box" class="notify-box"></div>
+    </aside>
+    <div class="nav-backdrop" id="nav-backdrop"></div>
+
+    <main class="pane">
+      <div id="reminder-bar" class="reminder-bar" aria-live="polite"></div>
+      <section id="list-pane"></section>
+    </main>
+  </div>
+
+  <!-- Share picker -->
+  <dialog id="share-dialog">
+    <form id="share-form" method="dialog">
+      <h2>Share “<span id="share-title"></span>”</h2>
+      <p class="muted">Only the people you tick can see this list.</p>
+      <input id="share-filter" type="search" placeholder="Find a user…" aria-label="Filter users" autocapitalize="none">
+      <ul id="share-users" class="share-users"></ul>
+      <p id="share-error" class="error" role="alert"></p>
+      <div class="row end">
+        <button type="button" id="share-cancel">Cancel</button>
+        <button type="submit" class="primary" value="save">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Full-size photo viewer -->
+  <dialog id="photo-dialog" class="photo-dialog">
+    <form method="dialog"><button class="close" aria-label="Close">×</button></form>
+    <img id="photo-full" alt="">
+  </dialog>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

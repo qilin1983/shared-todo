@@ -1,0 +1,19 @@
+{
+  "name": "shared-todo",
+  "version": "1.0.0",
+  "description": "To-do lists with free-form text, photos, user accounts and per-user sharing",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "multer": "^2.0.2",
+    "web-push": "^3.6.7"
+  }
+}
