@@ -210,7 +210,13 @@ function parseCookies(header = '') {
   const out = {};
   for (const part of header.split(';')) {
     const i = part.indexOf('=');
-    if (i > 0) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+    if (i <= 0) continue;
+    const raw = part.slice(i + 1).trim();
+    // Cookies from other apps on the same host may not be valid percent-encoding;
+    // keep the raw value rather than letting URIError fail every request.
+    let value = raw;
+    try { value = decodeURIComponent(raw); } catch {}
+    out[part.slice(0, i).trim()] = value;
   }
   return out;
 }
