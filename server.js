@@ -96,18 +96,68 @@ db.exec(`
 `);
 
 // Columns added after the first release — add them to existing databases.
-const ITEM_MIGRATIONS = {
-  repeat: "TEXT NOT NULL DEFAULT 'none'",      // none | daily | weekdays | weekly | monthly | yearly
-  repeat_anchor: 'INTEGER',                   // first due date of the series (keeps "31st" monthly stable)
-  tz: 'TEXT',                                 // creator's time zone, for calendar-correct repeats
-  last_done_at: 'INTEGER',                    // last time a repeating item was completed
-  assigned_to: 'INTEGER REFERENCES users(id) ON DELETE SET NULL',
+const MIGRATIONS = {
+  items: {
+    repeat: "TEXT NOT NULL DEFAULT 'none'",      // none | daily | weekdays | weekly | monthly | yearly
+    repeat_anchor: 'INTEGER',                   // first due date of the series (keeps "31st" monthly stable)
+    tz: 'TEXT',                                 // creator's time zone, for calendar-correct repeats
+    last_done_at: 'INTEGER',                    // last time a repeating item was completed
+    assigned_to: 'INTEGER REFERENCES users(id) ON DELETE SET NULL',
+    priority: 'INTEGER NOT NULL DEFAULT 0',     // 0 none, 1 low, 2 medium, 3 high
+    labels: "TEXT NOT NULL DEFAULT '[]'",       // JSON array of strings
+    position: 'REAL',                           // manual (drag-and-drop) order within the list
+  },
+  users: {
+    display_name: 'TEXT',
+    avatar_filename: 'TEXT',
+    avatar_mime: 'TEXT',
+    avatar_version: 'INTEGER',                  // cache-buster for the avatar URL
+  },
 };
-const itemCols = new Set(db.prepare('PRAGMA table_info(items)').all().map((c) => c.name));
-for (const [col, def] of Object.entries(ITEM_MIGRATIONS)) {
-  if (!itemCols.has(col)) db.exec(`ALTER TABLE items ADD COLUMN ${col} ${def}`);
+for (const [table, cols] of Object.entries(MIGRATIONS)) {
+  const existing = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
+  for (const [col, def] of Object.entries(cols)) {
+    if (!existing.has(col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${def}`);
+  }
 }
-db.exec('CREATE INDEX IF NOT EXISTS idx_items_assigned ON items(assigned_to)');
+// Existing items keep their newest-first order when manual ordering is introduced.
+db.exec('UPDATE items SET position = -id WHERE position IS NULL');
+
+db.exec(`
+  CREATE INDEX IF NOT EXISTS idx_items_assigned ON items(assigned_to);
+
+  CREATE TABLE IF NOT EXISTS subtasks (
+    id         INTEGER PRIMARY KEY,
+    item_id    INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    body       TEXT NOT NULL,
+    done       INTEGER NOT NULL DEFAULT 0,
+    position   REAL NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_subtasks_item ON subtasks(item_id);
+
+  CREATE TABLE IF NOT EXISTS comments (
+    id         INTEGER PRIMARY KEY,
+    item_id    INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    user_id    INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    body       TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_comments_item ON comments(item_id);
+
+  -- Who did what on a list. item_id has no FK so history survives deleting the to-do.
+  CREATE TABLE IF NOT EXISTS activity (
+    id         INTEGER PRIMARY KEY,
+    list_id    INTEGER NOT NULL REFERENCES lists(id) ON DELETE CASCADE,
+    user_id    INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    item_id    INTEGER,
+    action     TEXT NOT NULL,
+    summary    TEXT NOT NULL DEFAULT '',   -- the to-do's first line at the time
+    detail     TEXT NOT NULL DEFAULT '',   -- extra context, e.g. new title or assignee
+    created_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_activity_list ON activity(list_id, id);
+`);
 
 db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(Date.now());
 
@@ -336,6 +386,22 @@ function requireListAccess(level) {
       if (!photo) throw new HttpError(404, 'Not found');
       req.photo = photo;
       listId = photo.list_id;
+    } else if (req.params.subtaskId) {
+      const st = db.prepare(`
+        SELECT st.*, i.list_id FROM subtasks st JOIN items i ON i.id = st.item_id WHERE st.id = ?`)
+        .get(Number(req.params.subtaskId));
+      if (!st) throw new HttpError(404, 'Not found');
+      req.subtask = st;
+      req.item = { id: st.item_id, list_id: st.list_id };
+      listId = st.list_id;
+    } else if (req.params.commentId) {
+      const c = db.prepare(`
+        SELECT c.*, i.list_id FROM comments c JOIN items i ON i.id = c.item_id WHERE c.id = ?`)
+        .get(Number(req.params.commentId));
+      if (!c) throw new HttpError(404, 'Not found');
+      req.comment = c;
+      req.item = { id: c.item_id, list_id: c.list_id };
+      listId = c.list_id;
     }
     const role = listRole(listId, req.user.id);
     if (!role) throw new HttpError(404, 'Not found');
@@ -376,20 +442,98 @@ function photosFor(itemIds) {
   return byItem;
 }
 
+/** SQL for a user's display name (falls back to the username). */
+const NAME = (alias) => `COALESCE(${alias}.display_name, ${alias}.username)`;
+const displayName = (user) => user.display_name || user.username;
+
 const ITEM_SELECT = `
   SELECT i.id, i.list_id, i.body, i.done, i.due_at, i.remind_at, i.repeat, i.last_done_at,
-    i.created_at, i.updated_at, i.created_by AS created_by_id, u.username AS created_by,
-    i.assigned_to AS assigned_to_id, ua.username AS assigned_to
+    i.priority, i.labels, i.position,
+    i.created_at, i.updated_at, i.created_by AS created_by_id, ${NAME('u')} AS created_by,
+    i.assigned_to AS assigned_to_id, ${NAME('ua')} AS assigned_to,
+    (SELECT COUNT(*) FROM comments c WHERE c.item_id = i.id) AS comment_count
   FROM items i
   LEFT JOIN users u ON u.id = i.created_by
   LEFT JOIN users ua ON ua.id = i.assigned_to`;
 
-function itemView(itemId) {
-  const item = db.prepare(`${ITEM_SELECT} WHERE i.id = ?`).get(itemId);
-  item.done = !!item.done;
-  item.photos = photosFor([itemId]).get(itemId);
-  return item;
+function subtasksFor(itemIds) {
+  const byItem = new Map(itemIds.map((id) => [id, []]));
+  if (itemIds.length === 0) return byItem;
+  const rows = db.prepare(
+    `SELECT id, item_id, body, done FROM subtasks WHERE item_id IN (${itemIds.map(() => '?').join(',')}) ORDER BY position, id`,
+  ).all(...itemIds);
+  for (const r of rows) byItem.get(r.item_id).push({ id: r.id, body: r.body, done: !!r.done });
+  return byItem;
 }
+
+/** Adds photos, sub-tasks and parsed labels to raw item rows. */
+function hydrateItems(rows) {
+  const ids = rows.map((i) => i.id);
+  const photos = photosFor(ids);
+  const subtasks = subtasksFor(ids);
+  return rows.map((i) => ({
+    ...i,
+    done: !!i.done,
+    labels: parseLabelsJson(i.labels),
+    photos: photos.get(i.id),
+    subtasks: subtasks.get(i.id),
+  }));
+}
+
+function itemView(itemId) {
+  return hydrateItems([db.prepare(`${ITEM_SELECT} WHERE i.id = ?`).get(itemId)])[0];
+}
+
+function parseLabelsJson(text) {
+  try {
+    const v = JSON.parse(text);
+    return Array.isArray(v) ? v : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Accepts an array or a comma-separated string; returns a clean, de-duplicated array. */
+function parseLabels(value) {
+  if (value === undefined) return undefined;
+  if (value === null || value === '') return [];
+  let list = value;
+  if (typeof value === 'string') {
+    try { list = JSON.parse(value); } catch { list = value.split(','); }
+  }
+  if (!Array.isArray(list)) throw new HttpError(400, 'Invalid labels');
+  const out = [];
+  const seen = new Set();
+  for (const raw of list) {
+    const label = String(raw).trim().replace(/^#/, '').replace(/\s+/g, ' ');
+    if (!label) continue;
+    if (label.length > 24) throw new HttpError(400, `Label "${label.slice(0, 24)}…" is too long (max 24 characters)`);
+    if (seen.has(label.toLowerCase())) continue;
+    seen.add(label.toLowerCase());
+    out.push(label);
+  }
+  if (out.length > 10) throw new HttpError(400, 'Up to 10 labels per to-do');
+  return out;
+}
+
+function parsePriority(value) {
+  if (value === undefined) return undefined;
+  if (value === null || value === '') return 0;
+  const n = Number(value);
+  if (![0, 1, 2, 3].includes(n)) throw new HttpError(400, 'Invalid priority');
+  return n;
+}
+
+const snippet = (body) => (body || '').split('\n')[0].slice(0, 80) || 'Photo to-do';
+
+/** Record a history entry for the list the request is acting on. */
+function logActivity(req, action, { itemId = null, summary = '', detail = '', listId = req.listId } = {}) {
+  db.prepare(`INSERT INTO activity (list_id, user_id, item_id, action, summary, detail, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)`)
+    .run(listId, req.user.id, itemId, action, String(summary).slice(0, 200), String(detail).slice(0, 200), Date.now());
+}
+
+const itemSnippet = (itemId) => snippet(db.prepare('SELECT body FROM items WHERE id = ?').get(itemId)?.body);
 
 function parseRepeat(value) {
   if (value === undefined) return undefined;
@@ -411,7 +555,7 @@ function notifyAssignee(itemId, assigneeId, byUser) {
   if (assigneeId == null || assigneeId === byUser.id) return;
   const item = db.prepare('SELECT i.body, i.list_id, l.title FROM items i JOIN lists l ON l.id = i.list_id WHERE i.id = ?').get(itemId);
   pushToUsers([assigneeId], {
-    title: `👤 ${byUser.username} assigned you a to-do`,
+    title: `👤 ${displayName(byUser)} assigned you a to-do`,
     body: `${item.title}: ${item.body.split('\n')[0].slice(0, 120) || 'Photo to-do'}`,
     tag: `assign-${itemId}`,
     url: `/#${item.list_id}`,
@@ -466,9 +610,10 @@ app.use('/api', (req, res, next) => {
 app.use('/api', (req, res, next) => {
   const token = parseCookies(req.headers.cookie).sid;
   if (token) {
+    req.sessionHash = sha256(token);
     req.user = db.prepare(`
-      SELECT u.id, u.username FROM sessions s JOIN users u ON u.id = s.user_id
-      WHERE s.token_hash = ? AND s.expires_at > ?`).get(sha256(token), Date.now());
+      SELECT u.id, u.username, u.display_name, u.avatar_version FROM sessions s JOIN users u ON u.id = s.user_id
+      WHERE s.token_hash = ? AND s.expires_at > ?`).get(req.sessionHash, Date.now());
   }
   next();
 });
@@ -487,6 +632,11 @@ function emit(userIds, event) {
   for (const id of new Set(userIds)) {
     for (const res of streams.get(id) ?? []) res.write(data);
   }
+}
+
+/** Names/avatars are shown everywhere, so tell every connected user to reload the directory. */
+function broadcastUsersChanged() {
+  emit([...streams.keys()], { type: 'users' });
 }
 
 app.get('/api/events', requireAuth, (req, res) => {
@@ -569,16 +719,93 @@ app.post('/api/logout', (req, res) => {
 
 app.get('/api/me', requireAuth, (req, res) => res.json(req.user));
 
-// Everyone except yourself — the pool you can pick from when sharing.
+// Directory of everyone (including you): used for sharing, names and avatars.
 app.get('/api/users', requireAuth, (req, res) => {
-  res.json(db.prepare('SELECT id, username FROM users WHERE id != ? ORDER BY username COLLATE NOCASE').all(req.user.id));
+  res.json(db.prepare(`
+    SELECT id, username, display_name, avatar_version FROM users
+    ORDER BY ${NAME('users')} COLLATE NOCASE`).all());
+});
+
+// ---- profile
+
+app.patch('/api/me', requireAuth, (req, res) => {
+  const raw = req.body?.display_name;
+  if (raw !== undefined) {
+    const name = raw == null ? '' : cleanText(raw, 40, 'Display name').trim().replace(/\s+/g, ' ');
+    db.prepare('UPDATE users SET display_name = ? WHERE id = ?').run(name || null, req.user.id);
+  }
+  broadcastUsersChanged();
+  res.json(db.prepare('SELECT id, username, display_name, avatar_version FROM users WHERE id = ?').get(req.user.id));
+});
+
+const avatarUpload = multer({
+  storage: multer.diskStorage({
+    destination: UPLOAD_DIR,
+    filename: (req, file, cb) => cb(null, `avatar-${crypto.randomUUID()}${IMAGE_TYPES[file.mimetype]}`),
+  }),
+  limits: { fileSize: 3 * 1024 * 1024, files: 1 },
+  fileFilter: (req, file, cb) => {
+    if (IMAGE_TYPES[file.mimetype]) cb(null, true);
+    else cb(new HttpError(400, 'Profile pictures must be an image'));
+  },
+});
+
+app.put('/api/me/avatar', requireAuth, avatarUpload.single('avatar'), (req, res) => {
+  if (!req.file) throw new HttpError(400, 'No picture uploaded');
+  const old = db.prepare('SELECT avatar_filename FROM users WHERE id = ?').get(req.user.id).avatar_filename;
+  const version = Date.now();
+  db.prepare('UPDATE users SET avatar_filename = ?, avatar_mime = ?, avatar_version = ? WHERE id = ?')
+    .run(req.file.filename, req.file.mimetype, version, req.user.id);
+  if (old) removeFiles([old]);
+  broadcastUsersChanged();
+  res.json({ avatar_version: version });
+});
+
+app.delete('/api/me/avatar', requireAuth, (req, res) => {
+  const old = db.prepare('SELECT avatar_filename FROM users WHERE id = ?').get(req.user.id).avatar_filename;
+  db.prepare('UPDATE users SET avatar_filename = NULL, avatar_mime = NULL, avatar_version = NULL WHERE id = ?').run(req.user.id);
+  if (old) removeFiles([old]);
+  broadcastUsersChanged();
+  res.status(204).end();
+});
+
+app.get('/api/users/:userId/avatar', requireAuth, (req, res) => {
+  const u = db.prepare('SELECT avatar_filename, avatar_mime FROM users WHERE id = ?').get(Number(req.params.userId));
+  if (!u?.avatar_filename) throw new HttpError(404, 'Not found');
+  res.set({
+    'Content-Type': u.avatar_mime,
+    // The URL carries ?v=<version>, so it can be cached for a long time.
+    'Cache-Control': 'private, max-age=31536000, immutable',
+    'Content-Security-Policy': "default-src 'none'; sandbox",
+  });
+  res.sendFile(path.join(UPLOAD_DIR, path.basename(u.avatar_filename)));
+});
+
+app.post('/api/me/password', requireAuth, (req, res) => {
+  const { current, next } = req.body ?? {};
+  if (typeof current !== 'string' || typeof next !== 'string') throw new HttpError(400, 'Invalid request');
+  const key = `pw|${req.user.id}`;
+  checkLoginRate(key);
+  const { password_hash } = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(req.user.id);
+  if (!verifyPassword(current, password_hash)) {
+    recordLoginFailure(key);
+    throw new HttpError(400, 'Your current password is not correct');
+  }
+  if (next.length < 8 || next.length > 200) throw new HttpError(400, 'New password must be at least 8 characters');
+  failedLogins.delete(key);
+  tx(() => {
+    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hashPassword(next), req.user.id);
+    // Sign out every other device; this one stays signed in.
+    db.prepare('DELETE FROM sessions WHERE user_id = ? AND token_hash != ?').run(req.user.id, req.sessionHash);
+  });
+  res.status(204).end();
 });
 
 // ---- lists
 
 function listsFor(me) {
   return db.prepare(`
-    SELECT l.id, l.title, u.username AS owner,
+    SELECT l.id, l.title, l.owner_id, ${NAME('u')} AS owner,
       CASE WHEN l.owner_id = :me THEN 'owner' WHEN s.can_edit = 1 THEN 'edit' ELSE 'view' END AS role,
       (SELECT COUNT(*) FROM items i WHERE i.list_id = l.id AND i.done = 0) AS open_count,
       (SELECT COUNT(*) FROM items i WHERE i.list_id = l.id AND i.done = 0 AND i.due_at < :now) AS overdue_count,
@@ -597,28 +824,31 @@ app.post('/api/lists', requireAuth, (req, res) => {
   if (!title) throw new HttpError(400, 'Title is required');
   const { lastInsertRowid } = db.prepare('INSERT INTO lists (owner_id, title) VALUES (?, ?)').run(req.user.id, title);
   req.listId = Number(lastInsertRowid);
+  logActivity(req, 'list_created', { detail: title });
   res.status(201).json({ id: req.listId, title });
 });
+
+/** SQL fragment: ids of lists the user :me can see. */
+const MY_LIST_IDS = `
+  SELECT l.id FROM lists l LEFT JOIN list_shares s ON s.list_id = l.id AND s.user_id = :me
+  WHERE l.owner_id = :me OR s.user_id IS NOT NULL`;
 
 // Everything open across all your lists, for the dashboard.
 app.get('/api/dashboard', requireAuth, (req, res) => {
   const me = req.user.id;
   const lists = listsFor(me);
   const shareNames = db.prepare(`
-    SELECT s.list_id, u.username FROM list_shares s JOIN users u ON u.id = s.user_id
-    JOIN lists l ON l.id = s.list_id WHERE l.owner_id = ? ORDER BY u.username COLLATE NOCASE`).all(me);
-  for (const l of lists) l.shared_with = shareNames.filter((s) => s.list_id === l.id).map((s) => s.username);
+    SELECT s.list_id, ${NAME('u')} AS name FROM list_shares s JOIN users u ON u.id = s.user_id
+    JOIN lists l ON l.id = s.list_id WHERE l.owner_id = ? ORDER BY name COLLATE NOCASE`).all(me);
+  for (const l of lists) l.shared_with = shareNames.filter((s) => s.list_id === l.id).map((s) => s.name);
   const items = db.prepare(`${ITEM_SELECT}
-    WHERE i.done = 0 AND i.list_id IN (
-      SELECT l.id FROM lists l LEFT JOIN list_shares s ON s.list_id = l.id AND s.user_id = :me
-      WHERE l.owner_id = :me OR s.user_id IS NOT NULL)
-    ORDER BY i.due_at IS NULL, i.due_at, i.id DESC`).all({ me });
+    WHERE i.done = 0 AND i.list_id IN (${MY_LIST_IDS})
+    ORDER BY i.due_at IS NULL, i.due_at, i.priority DESC, i.id DESC`).all({ me });
   const photoCounts = new Map(db.prepare(`
     SELECT item_id, COUNT(*) AS n FROM photos WHERE item_id IN (
-      SELECT i.id FROM items i JOIN lists l ON l.id = i.list_id
-      LEFT JOIN list_shares s ON s.list_id = l.id AND s.user_id = :me
-      WHERE i.done = 0 AND (l.owner_id = :me OR s.user_id IS NOT NULL))
+      SELECT i.id FROM items i WHERE i.done = 0 AND i.list_id IN (${MY_LIST_IDS}))
     GROUP BY item_id`).all({ me }).map((r) => [r.item_id, r.n]));
+  const subtasks = subtasksFor(items.map((i) => i.id));
   const doneThisWeek = db.prepare(`
     SELECT COUNT(*) AS n FROM items i JOIN lists l ON l.id = i.list_id
     LEFT JOIN list_shares s ON s.list_id = l.id AND s.user_id = :me
@@ -627,31 +857,97 @@ app.get('/api/dashboard', requireAuth, (req, res) => {
     .get({ me, weekAgo: Date.now() - 7 * DAY_MS }).n;
   res.json({
     lists,
-    items: items.map((i) => ({ ...i, done: false, photo_count: photoCounts.get(i.id) ?? 0 })),
+    items: items.map((i) => {
+      const st = subtasks.get(i.id);
+      return {
+        ...i,
+        done: false,
+        labels: parseLabelsJson(i.labels),
+        photo_count: photoCounts.get(i.id) ?? 0,
+        subtask_total: st.length,
+        subtask_done: st.filter((s) => s.done).length,
+      };
+    }),
     done_this_week: doneThisWeek,
+    activity: activityFeed({ me, limit: 8 }),
   });
+});
+
+// ---- activity history
+
+function activityFeed({ me, listId = null, before = null, limit = 50 }) {
+  return db.prepare(`
+    SELECT a.id, a.list_id, l.title AS list_title, a.user_id, ${NAME('u')} AS user_name,
+      a.item_id, a.action, a.summary, a.detail, a.created_at
+    FROM activity a
+    JOIN lists l ON l.id = a.list_id
+    LEFT JOIN users u ON u.id = a.user_id
+    WHERE a.list_id IN (${MY_LIST_IDS})
+      AND (:listId IS NULL OR a.list_id = :listId)
+      AND (:before IS NULL OR a.id < :before)
+    ORDER BY a.id DESC LIMIT :limit`).all({ me, listId, before, limit });
+}
+
+app.get('/api/lists/:listId/activity', requireAuth, requireListAccess('view'), (req, res) => {
+  const before = req.query.before ? Number(req.query.before) : null;
+  res.json(activityFeed({ me: req.user.id, listId: req.listId, before, limit: 50 }));
+});
+
+// ---- search
+
+app.get('/api/search', requireAuth, (req, res) => {
+  const q = String(req.query.q ?? '').trim();
+  if (q.length < 2) return res.json({ lists: [], items: [] });
+  const like = `%${q.slice(0, 100).replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+  const params = { me: req.user.id, q: like };
+  const lists = db.prepare(`
+    SELECT l.id, l.title FROM lists l WHERE l.id IN (${MY_LIST_IDS}) AND l.title LIKE :q ESCAPE '\\'
+    ORDER BY l.title COLLATE NOCASE LIMIT 20`).all(params);
+  const hits = db.prepare(`
+    SELECT i.id,
+      (SELECT st.body FROM subtasks st WHERE st.item_id = i.id AND st.body LIKE :q ESCAPE '\\' LIMIT 1) AS subtask_match,
+      (SELECT c.body FROM comments c WHERE c.item_id = i.id AND c.body LIKE :q ESCAPE '\\' ORDER BY c.id DESC LIMIT 1) AS comment_match
+    FROM items i
+    WHERE i.list_id IN (${MY_LIST_IDS}) AND (
+      i.body LIKE :q ESCAPE '\\' OR i.labels LIKE :q ESCAPE '\\'
+      OR EXISTS (SELECT 1 FROM subtasks st WHERE st.item_id = i.id AND st.body LIKE :q ESCAPE '\\')
+      OR EXISTS (SELECT 1 FROM comments c WHERE c.item_id = i.id AND c.body LIKE :q ESCAPE '\\'))
+    ORDER BY i.done, i.updated_at DESC LIMIT 100`).all(params);
+  const extra = new Map(hits.map((h) => [h.id, h]));
+  const rows = hits.length
+    ? db.prepare(`${ITEM_SELECT} WHERE i.id IN (${hits.map(() => '?').join(',')})`).all(...hits.map((h) => h.id))
+    : [];
+  const listInfo = new Map(listsFor(req.user.id).map((l) => [l.id, l]));
+  const items = hydrateItems(rows)
+    .map((i) => ({
+      ...i,
+      list_title: listInfo.get(i.list_id).title,
+      role: listInfo.get(i.list_id).role,
+      subtask_match: extra.get(i.id).subtask_match,
+      comment_match: extra.get(i.id).comment_match,
+    }))
+    .sort((a, b) => Number(a.done) - Number(b.done) || b.updated_at.localeCompare(a.updated_at));
+  res.json({ lists, items });
 });
 
 app.get('/api/lists/:listId', requireAuth, requireListAccess('view'), (req, res) => {
   const list = db.prepare(`
-    SELECT l.id, l.title, l.created_at, l.owner_id, u.username AS owner
+    SELECT l.id, l.title, l.created_at, l.owner_id, ${NAME('u')} AS owner
     FROM lists l JOIN users u ON u.id = l.owner_id WHERE l.id = ?`).get(req.listId);
-  // Open items first, soonest deadline first, then newest.
-  const items = db.prepare(`${ITEM_SELECT}
-    WHERE i.list_id = ? ORDER BY i.done, i.due_at IS NULL, i.due_at, i.id DESC`).all(req.listId);
-  const photos = photosFor(items.map((i) => i.id));
+  // The client decides the display order (deadline / priority / custom); send manual order.
+  const items = db.prepare(`${ITEM_SELECT} WHERE i.list_id = ? ORDER BY i.done, i.position, i.id DESC`).all(req.listId);
   const shares = db.prepare(`
-    SELECT u.id AS user_id, u.username, s.can_edit
+    SELECT u.id AS user_id, u.username, ${NAME('u')} AS name, s.can_edit
     FROM list_shares s JOIN users u ON u.id = s.user_id
-    WHERE s.list_id = ? ORDER BY u.username COLLATE NOCASE`).all(req.listId)
+    WHERE s.list_id = ? ORDER BY name COLLATE NOCASE`).all(req.listId)
     .map((s) => ({ ...s, can_edit: !!s.can_edit }));
   res.json({
     ...list,
     role: req.role,
     shares,
     // People who can be assigned to-dos on this list.
-    members: [{ id: list.owner_id, username: list.owner }, ...shares.map((s) => ({ id: s.user_id, username: s.username }))],
-    items: items.map((i) => ({ ...i, done: !!i.done, photos: photos.get(i.id) })),
+    members: [{ id: list.owner_id, name: list.owner }, ...shares.map((s) => ({ id: s.user_id, name: s.name }))],
+    items: hydrateItems(items),
   });
 });
 
@@ -659,7 +955,21 @@ app.patch('/api/lists/:listId', requireAuth, requireListAccess('owner'), (req, r
   const title = cleanText(req.body?.title, 120, 'Title').trim();
   if (!title) throw new HttpError(400, 'Title is required');
   db.prepare('UPDATE lists SET title = ? WHERE id = ?').run(title, req.listId);
+  logActivity(req, 'list_renamed', { detail: title });
   res.json({ id: req.listId, title });
+});
+
+// Save a drag-and-drop order. Body: { ids: [itemId, ...] } in the new order.
+app.put('/api/lists/:listId/order', requireAuth, requireListAccess('edit'), (req, res) => {
+  const ids = req.body?.ids;
+  if (!Array.isArray(ids) || ids.length > 5000) throw new HttpError(400, 'ids must be an array');
+  const inList = new Set(db.prepare('SELECT id FROM items WHERE list_id = ?').all(req.listId).map((r) => r.id));
+  if (!ids.every((id) => inList.has(Number(id)))) throw new HttpError(400, 'Every id must be a to-do on this list');
+  tx(() => {
+    const stmt = db.prepare('UPDATE items SET position = ? WHERE id = ?');
+    ids.forEach((id, index) => stmt.run(index, Number(id)));
+  });
+  res.status(204).end();
 });
 
 app.delete('/api/lists/:listId', requireAuth, requireListAccess('owner'), (req, res) => {
@@ -693,6 +1003,10 @@ app.put('/api/lists/:listId/shares', requireAuth, requireListAccess('owner'), (r
     for (const [userId, edit] of clean) ins.run(req.listId, userId, edit);
     dropStaleAssignments(req.listId);
   });
+  const names = db.prepare(`
+    SELECT ${NAME('u')} AS name FROM list_shares s JOIN users u ON u.id = s.user_id
+    WHERE s.list_id = ? ORDER BY name COLLATE NOCASE`).all(req.listId).map((r) => r.name);
+  logActivity(req, 'sharing_changed', { detail: names.join(', ') });
   // Tell people who gained *and* lost access.
   req.notifyUsers = [...before, ...listMembers(req.listId)];
   res.status(204).end();
@@ -706,7 +1020,54 @@ app.delete('/api/lists/:listId/shares/me', requireAuth, requireListAccess('view'
     db.prepare('DELETE FROM list_shares WHERE list_id = ? AND user_id = ?').run(req.listId, req.user.id);
     dropStaleAssignments(req.listId);
   });
+  logActivity(req, 'member_left');
   res.status(204).end();
+});
+
+// ---- export
+
+function csvCell(value) {
+  let s = value == null ? '' : String(value);
+  // Stop spreadsheet apps from treating text as a formula.
+  if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
+  return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+app.get('/api/lists/:listId/export.csv', requireAuth, requireListAccess('view'), (req, res) => {
+  const tz = validTimeZone(req.query.tz) ? req.query.tz : 'UTC';
+  // sv-SE formats as "2026-09-24 13:05", which spreadsheets read as a date.
+  const fmt = new Intl.DateTimeFormat('sv-SE', { timeZone: tz, dateStyle: 'short', timeStyle: 'short' });
+  const when = (ms) => (ms == null ? '' : fmt.format(new Date(ms)));
+  const list = db.prepare('SELECT title FROM lists WHERE id = ?').get(req.listId);
+  const items = hydrateItems(db.prepare(`${ITEM_SELECT} WHERE i.list_id = ? ORDER BY i.done, i.position, i.id DESC`).all(req.listId));
+  const header = ['Status', 'To-do', 'Details', 'Priority', 'Labels', 'Deadline', 'Reminder', 'Repeats',
+    'Assigned to', 'Created by', 'Created', 'Sub-tasks', 'Photos', 'Comments'];
+  const rows = items.map((i) => {
+    const [first, ...rest] = i.body.split('\n');
+    return [
+      i.done ? 'Done' : 'Open',
+      first,
+      rest.join('\n').trim(),
+      ['', 'Low', 'Medium', 'High'][i.priority],
+      i.labels.join(', '),
+      when(i.due_at),
+      when(i.remind_at),
+      i.repeat === 'none' ? '' : i.repeat,
+      i.assigned_to ?? '',
+      i.created_by ?? '',
+      when(Date.parse(i.created_at.replace(' ', 'T') + 'Z')),
+      i.subtasks.map((s) => `[${s.done ? 'x' : ' '}] ${s.body}`).join('\n'),
+      i.photos.length,
+      i.comment_count,
+    ];
+  });
+  const csv = [header, ...rows].map((r) => r.map(csvCell).join(',')).join('\r\n');
+  const filename = `${list.title.replace(/[^\w\- ]+/g, '').trim().slice(0, 60) || 'list'}.csv`;
+  res.set({
+    'Content-Type': 'text/csv; charset=utf-8',
+    'Content-Disposition': `attachment; filename="${filename}"`,
+  });
+  res.send('﻿' + csv); // BOM so Excel opens it as UTF-8
 });
 
 // ---- items
@@ -720,17 +1081,48 @@ app.post('/api/lists/:listId/items', requireAuth, requireListAccess('edit'), upl
   if (repeat !== 'none' && dueAt == null) throw new HttpError(400, 'A repeating to-do needs a deadline');
   const tz = validTimeZone(req.body?.tz) ? req.body.tz : null;
   const assignee = parseAssignee(req.body?.assigned_to, req.listId) ?? null;
+  const priority = parsePriority(req.body?.priority) ?? 0;
+  const labels = parseLabels(req.body?.labels) ?? [];
+  const subtaskTexts = parseSubtaskList(req.body?.subtasks);
   const id = tx(() => {
+    // New to-dos go to the top of the custom order.
+    const { top } = db.prepare('SELECT MIN(position) AS top FROM items WHERE list_id = ?').get(req.listId);
     const { lastInsertRowid } = db.prepare(`
-      INSERT INTO items (list_id, body, due_at, remind_at, repeat, repeat_anchor, tz, assigned_to, created_by)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(req.listId, body, dueAt, remindAt, repeat, repeat === 'none' ? null : dueAt, tz, assignee, req.user.id);
-    insertPhotos(Number(lastInsertRowid), req.files);
-    return Number(lastInsertRowid);
+      INSERT INTO items (list_id, body, due_at, remind_at, repeat, repeat_anchor, tz, assigned_to,
+        priority, labels, position, created_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(req.listId, body, dueAt, remindAt, repeat, repeat === 'none' ? null : dueAt, tz, assignee,
+        priority, JSON.stringify(labels), (top ?? 0) - 1, req.user.id);
+    const itemId = Number(lastInsertRowid);
+    insertPhotos(itemId, req.files);
+    const ins = db.prepare('INSERT INTO subtasks (item_id, body, position, created_at) VALUES (?, ?, ?, ?)');
+    subtaskTexts.forEach((text, i) => ins.run(itemId, text, i, Date.now()));
+    return itemId;
   });
+  logActivity(req, 'item_added', { itemId: id, summary: snippet(body) });
+  if (assignee != null) logActivity(req, 'item_assigned', { itemId: id, summary: snippet(body), detail: memberName(assignee) });
   notifyAssignee(id, assignee, req.user);
   res.status(201).json(itemView(id));
 });
+
+const memberName = (userId) => {
+  const u = db.prepare('SELECT username, display_name FROM users WHERE id = ?').get(userId);
+  return u ? displayName(u) : '';
+};
+
+/** Optional list of sub-task texts sent when creating a to-do (JSON array or newline-separated). */
+function parseSubtaskList(value) {
+  if (value == null || value === '') return [];
+  let list = value;
+  if (typeof value === 'string') {
+    try { list = JSON.parse(value); } catch { list = value.split('\n'); }
+  }
+  if (!Array.isArray(list)) throw new HttpError(400, 'Invalid sub-tasks');
+  const out = list.map((s) => String(s).trim()).filter(Boolean);
+  if (out.length > 50) throw new HttpError(400, 'Up to 50 sub-tasks per to-do');
+  for (const s of out) if (s.length > 500) throw new HttpError(400, 'Sub-tasks are limited to 500 characters');
+  return out;
+}
 
 app.patch('/api/items/:itemId', requireAuth, requireListAccess('edit'), (req, res) => {
   const { body, done } = req.body ?? {};
@@ -738,6 +1130,8 @@ app.patch('/api/items/:itemId', requireAuth, requireListAccess('edit'), (req, re
   const remindAt = parseTime(req.body?.remind_at, 'Reminder');
   const repeat = parseRepeat(req.body?.repeat);
   const assignee = parseAssignee(req.body?.assigned_to, req.listId);
+  const priority = parsePriority(req.body?.priority);
+  const labels = parseLabels(req.body?.labels);
   const current = db.prepare('SELECT * FROM items WHERE id = ?').get(req.item.id);
   const next = {
     due_at: dueAt !== undefined ? dueAt : current.due_at,
@@ -745,10 +1139,17 @@ app.patch('/api/items/:itemId', requireAuth, requireListAccess('edit'), (req, re
   };
   if (next.repeat !== 'none' && next.due_at == null) throw new HttpError(400, 'A repeating to-do needs a deadline');
 
+  const cleanBody = body !== undefined ? cleanText(body, 20000, 'Text').trim() : undefined;
+  const edited = (cleanBody !== undefined && cleanBody !== current.body)
+    || (dueAt !== undefined && dueAt !== current.due_at)
+    || (repeat !== undefined && repeat !== current.repeat)
+    || (priority !== undefined && priority !== current.priority)
+    || (labels !== undefined && JSON.stringify(labels) !== current.labels);
+
   let advancedTo = null;
   tx(() => {
     const touch = (sql, ...args) => db.prepare(`UPDATE items SET ${sql}, updated_at = datetime('now') WHERE id = ?`).run(...args, req.item.id);
-    if (body !== undefined) touch('body = ?', cleanText(body, 20000, 'Text').trim());
+    if (cleanBody !== undefined) touch('body = ?', cleanBody);
     if (validTimeZone(req.body?.tz)) db.prepare('UPDATE items SET tz = ? WHERE id = ?').run(req.body.tz, req.item.id);
     if (dueAt !== undefined) touch('due_at = ?', dueAt);
     if (remindAt !== undefined) {
@@ -760,6 +1161,8 @@ app.patch('/api/items/:itemId', requireAuth, requireListAccess('edit'), (req, re
       touch('repeat = ?, repeat_anchor = ?', next.repeat, next.repeat === 'none' ? null : next.due_at);
     }
     if (assignee !== undefined) touch('assigned_to = ?', assignee);
+    if (priority !== undefined) touch('priority = ?', priority);
+    if (labels !== undefined) touch('labels = ?', JSON.stringify(labels));
 
     if (done !== undefined) {
       const item = db.prepare('SELECT * FROM items WHERE id = ?').get(req.item.id);
@@ -773,14 +1176,26 @@ app.patch('/api/items/:itemId', requireAuth, requireListAccess('edit'), (req, re
       }
     }
   });
-  if (assignee !== undefined && assignee !== current.assigned_to) notifyAssignee(req.item.id, assignee, req.user);
+
+  const summary = itemSnippet(req.item.id);
+  if (edited) logActivity(req, 'item_edited', { itemId: req.item.id, summary });
+  if (assignee !== undefined && assignee !== current.assigned_to) {
+    logActivity(req, 'item_assigned', { itemId: req.item.id, summary, detail: assignee == null ? '' : memberName(assignee) });
+    notifyAssignee(req.item.id, assignee, req.user);
+  }
+  if (done !== undefined && (advancedTo || !!done !== !!current.done)) {
+    const action = advancedTo ? 'item_repeated' : done ? 'item_completed' : 'item_reopened';
+    logActivity(req, action, { itemId: req.item.id, summary, detail: advancedTo ? String(advancedTo) : '' });
+  }
   res.json({ ...itemView(req.item.id), advanced_to: advancedTo });
 });
 
 app.delete('/api/items/:itemId', requireAuth, requireListAccess('edit'), (req, res) => {
   const files = db.prepare('SELECT filename FROM photos WHERE item_id = ?').all(req.item.id).map((r) => r.filename);
+  const summary = itemSnippet(req.item.id);
   db.prepare('DELETE FROM items WHERE id = ?').run(req.item.id);
   removeFiles(files);
+  logActivity(req, 'item_deleted', { itemId: req.item.id, summary });
   res.status(204).end();
 });
 
@@ -790,7 +1205,87 @@ app.post('/api/items/:itemId/photos', requireAuth, requireListAccess('edit'), up
     insertPhotos(req.item.id, req.files);
     db.prepare("UPDATE items SET updated_at = datetime('now') WHERE id = ?").run(req.item.id);
   });
+  logActivity(req, 'photo_added', { itemId: req.item.id, summary: itemSnippet(req.item.id), detail: String(req.files.length) });
   res.status(201).json(itemView(req.item.id));
+});
+
+// ---- sub-tasks
+
+app.post('/api/items/:itemId/subtasks', requireAuth, requireListAccess('edit'), (req, res) => {
+  const body = cleanText(req.body?.body, 500, 'Sub-task').trim();
+  if (!body) throw new HttpError(400, 'Sub-task text is required');
+  const { n, last } = db.prepare('SELECT COUNT(*) AS n, MAX(position) AS last FROM subtasks WHERE item_id = ?').get(req.item.id);
+  if (n >= 50) throw new HttpError(400, 'Up to 50 sub-tasks per to-do');
+  db.prepare('INSERT INTO subtasks (item_id, body, position, created_at) VALUES (?, ?, ?, ?)')
+    .run(req.item.id, body, (last ?? -1) + 1, Date.now());
+  db.prepare("UPDATE items SET updated_at = datetime('now') WHERE id = ?").run(req.item.id);
+  logActivity(req, 'subtask_added', { itemId: req.item.id, summary: itemSnippet(req.item.id), detail: body });
+  res.status(201).json(itemView(req.item.id));
+});
+
+app.patch('/api/subtasks/:subtaskId', requireAuth, requireListAccess('edit'), (req, res) => {
+  const { body, done } = req.body ?? {};
+  if (body !== undefined) {
+    const text = cleanText(body, 500, 'Sub-task').trim();
+    if (!text) throw new HttpError(400, 'Sub-task text is required');
+    db.prepare('UPDATE subtasks SET body = ? WHERE id = ?').run(text, req.subtask.id);
+  }
+  if (done !== undefined && !!done !== !!req.subtask.done) {
+    db.prepare('UPDATE subtasks SET done = ? WHERE id = ?').run(done ? 1 : 0, req.subtask.id);
+    logActivity(req, done ? 'subtask_done' : 'subtask_undone',
+      { itemId: req.item.id, summary: itemSnippet(req.item.id), detail: req.subtask.body });
+  }
+  db.prepare("UPDATE items SET updated_at = datetime('now') WHERE id = ?").run(req.item.id);
+  res.json(itemView(req.item.id));
+});
+
+app.delete('/api/subtasks/:subtaskId', requireAuth, requireListAccess('edit'), (req, res) => {
+  db.prepare('DELETE FROM subtasks WHERE id = ?').run(req.subtask.id);
+  logActivity(req, 'subtask_deleted', { itemId: req.item.id, summary: itemSnippet(req.item.id), detail: req.subtask.body });
+  res.json(itemView(req.item.id));
+});
+
+// ---- comments (anyone who can see the list can comment, including view-only members)
+
+const COMMENT_SELECT = `
+  SELECT c.id, c.item_id, c.user_id, ${NAME('u')} AS user_name, c.body, c.created_at
+  FROM comments c LEFT JOIN users u ON u.id = c.user_id`;
+
+app.get('/api/items/:itemId/comments', requireAuth, requireListAccess('view'), (req, res) => {
+  res.json(db.prepare(`${COMMENT_SELECT} WHERE c.item_id = ? ORDER BY c.id`).all(req.item.id));
+});
+
+app.post('/api/items/:itemId/comments', requireAuth, requireListAccess('view'), (req, res) => {
+  const body = cleanText(req.body?.body, 5000, 'Comment').trim();
+  if (!body) throw new HttpError(400, 'Comment is empty');
+  const { lastInsertRowid } = db.prepare('INSERT INTO comments (item_id, user_id, body, created_at) VALUES (?, ?, ?, ?)')
+    .run(req.item.id, req.user.id, body, Date.now());
+  const summary = itemSnippet(req.item.id);
+  logActivity(req, 'comment_added', { itemId: req.item.id, summary, detail: body.slice(0, 120) });
+
+  // Notify the people involved: creator, assignee and earlier commenters (still on the list).
+  const involved = db.prepare(`
+    SELECT created_by AS id FROM items WHERE id = :item
+    UNION SELECT assigned_to FROM items WHERE id = :item
+    UNION SELECT user_id FROM comments WHERE item_id = :item`).all({ item: req.item.id }).map((r) => r.id);
+  const members = new Set(listMembers(req.listId));
+  const audience = [...new Set(involved)].filter((id) => id != null && id !== req.user.id && members.has(id));
+  pushToUsers(audience, {
+    title: `💬 ${displayName(req.user)} on “${summary}”`,
+    body: body.slice(0, 140),
+    tag: `comment-${req.item.id}`,
+    url: `/#${req.listId}`,
+  });
+  res.status(201).json(db.prepare(`${COMMENT_SELECT} WHERE c.id = ?`).get(Number(lastInsertRowid)));
+});
+
+// Authors can delete their own comments; the list owner can delete any.
+app.delete('/api/comments/:commentId', requireAuth, requireListAccess('view'), (req, res) => {
+  if (req.comment.user_id !== req.user.id && req.role !== 'owner') {
+    throw new HttpError(403, 'You can only delete your own comments');
+  }
+  db.prepare('DELETE FROM comments WHERE id = ?').run(req.comment.id);
+  res.status(204).end();
 });
 
 // ---- reminders
@@ -912,6 +1407,7 @@ app.get('/api/photos/:photoId', requireAuth, requireListAccess('view'), (req, re
 app.delete('/api/photos/:photoId', requireAuth, requireListAccess('edit'), (req, res) => {
   db.prepare('DELETE FROM photos WHERE id = ?').run(req.photo.id);
   removeFiles([req.photo.filename]);
+  logActivity(req, 'photo_removed', { itemId: req.photo.item_id, summary: itemSnippet(req.photo.item_id) });
   res.status(204).end();
 });
 

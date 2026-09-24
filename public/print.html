@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Print list</title>
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="print.css">
+</head>
+<body>
+  <div class="toolbar no-print">
+    <button id="print-btn" class="primary">🖨 Print / Save as PDF</button>
+    <label><input type="checkbox" id="opt-done" checked> Completed to-dos</label>
+    <label><input type="checkbox" id="opt-photos" checked> Photos</label>
+    <label><input type="checkbox" id="opt-subtasks" checked> Sub-tasks</label>
+    <span class="hint">Choose “Save as PDF” as the printer to get a PDF file.</span>
+  </div>
+  <main id="doc"><p>Loading…</p></main>
+  <script type="module" src="js/print.js"></script>
+</body>
+</html>

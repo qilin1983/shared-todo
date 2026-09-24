@@ -38,8 +38,14 @@
     <header class="topbar">
       <button id="menu-btn" class="ghost menu-btn" aria-label="Show lists" aria-expanded="false">☰</button>
       <strong class="brand">Shared To-Do</strong>
+      <div class="search" role="search">
+        <span class="search-icon" aria-hidden="true">🔍</span>
+        <input id="search-input" type="search" placeholder="Search to-dos, labels, comments…" aria-label="Search" autocomplete="off">
+        <button id="search-clear" class="ghost search-clear" aria-label="Close search">✕</button>
+      </div>
       <span class="spacer"></span>
-      <span id="whoami" class="muted"></span>
+      <button id="search-toggle" class="ghost search-toggle" aria-label="Search">🔍</button>
+      <button id="me-btn" class="ghost me-btn" aria-label="Your profile"></button>
       <button id="logout-btn" class="ghost">Sign out</button>
     </header>
 
@@ -59,12 +65,14 @@
     </main>
   </div>
 
+  <datalist id="label-suggestions"></datalist>
+
   <!-- Share picker -->
   <dialog id="share-dialog">
     <form id="share-form" method="dialog">
       <h2>Share “<span id="share-title"></span>”</h2>
-      <p class="muted">Only the people you tick can see this list.</p>
-      <input id="share-filter" type="search" placeholder="Find a user…" aria-label="Filter users" autocapitalize="none">
+      <p class="muted">Only the people you tick can see this list. View-only people can still comment.</p>
+      <input id="share-filter" type="search" placeholder="Find a person…" aria-label="Filter people" autocapitalize="none">
       <ul id="share-users" class="share-users"></ul>
       <p id="share-error" class="error" role="alert"></p>
       <div class="row end">
@@ -72,6 +80,64 @@
         <button type="submit" class="primary" value="save">Save</button>
       </div>
     </form>
+  </dialog>
+
+  <!-- Activity history -->
+  <dialog id="history-dialog" class="wide-dialog">
+    <div class="dialog-head">
+      <h2>History · <span id="history-title"></span></h2>
+      <button id="history-close" class="ghost" aria-label="Close">✕</button>
+    </div>
+    <div id="history-body" class="dialog-scroll"></div>
+  </dialog>
+
+  <!-- Profile -->
+  <dialog id="profile-dialog" class="wide-dialog">
+    <div class="dialog-head">
+      <h2>Your profile</h2>
+      <button id="profile-close" class="ghost" aria-label="Close">✕</button>
+    </div>
+    <div class="dialog-scroll profile">
+      <div class="profile-top">
+        <div id="profile-avatar"></div>
+        <div class="grid-gap">
+          <div class="row wrap">
+            <button id="avatar-change" type="button">📷 Change picture</button>
+            <button id="avatar-remove" type="button" class="ghost danger">Remove</button>
+          </div>
+          <input id="avatar-input" type="file" accept="image/*" hidden>
+          <span class="muted small">Shown next to your name, comments and assigned to-dos.</span>
+        </div>
+      </div>
+
+      <form id="profile-form" class="grid-gap">
+        <label class="field-label">Display name
+          <input id="profile-name" maxlength="40" placeholder="How others see you">
+        </label>
+        <span class="muted small">Your username stays <strong id="profile-username"></strong> for signing in.</span>
+        <p id="profile-error" class="error" role="alert"></p>
+        <div class="row end"><button class="primary" type="submit">Save name</button></div>
+      </form>
+
+      <hr>
+
+      <form id="pw-form" class="grid-gap" autocomplete="on">
+        <h3 class="section-title">Change password</h3>
+        <input type="text" name="username" autocomplete="username" hidden>
+        <label class="field-label">Current password
+          <input name="current" type="password" autocomplete="current-password" required>
+        </label>
+        <label class="field-label">New password
+          <input name="next" type="password" autocomplete="new-password" minlength="8" required>
+        </label>
+        <label class="field-label">Confirm new password
+          <input name="confirm" type="password" autocomplete="new-password" minlength="8" required>
+        </label>
+        <span class="muted small">You'll stay signed in here. Your other devices will be signed out.</span>
+        <p id="pw-error" class="error" role="alert"></p>
+        <div class="row end"><button class="primary" type="submit">Change password</button></div>
+      </form>
+    </div>
   </dialog>
 
   <!-- Full-size photo viewer -->
@@ -82,6 +148,6 @@
 
   <div id="toast" class="toast" role="status" hidden></div>
 
-  <script type="module" src="app.js"></script>
+  <script type="module" src="js/app.js"></script>
 </body>
 </html>

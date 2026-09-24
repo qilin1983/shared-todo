@@ -29,10 +29,35 @@ Data (SQLite database, uploaded photos, push keys) lives in `./data`.
   the next date (in the creator's time zone; "31st monthly" becomes the 30th/28th in short months)
 - **Assign** a to-do to anyone on the list; they get notified, and its reminder goes only to them
 - **Live updates**: changes by other people appear instantly (Server-Sent Events)
+- **Comments** on any to-do (view-only members can comment too); people involved get notified
+- **Activity history** per list ("🕘 History") and a recent-activity feed on the dashboard
+- **Priority** (Low / Medium / High) and **labels** (#tags), with filters on lists and the dashboard
+- **Search** across all your lists: to-do text, labels, sub-tasks and comments
+- **Sub-tasks** (checklists inside a to-do) and **drag-to-reorder** (Sort → "My order"; works on touch screens)
+- **Profiles**: display name, profile picture, change password (signs out your other devices)
+- **Export** a list to CSV (opens in Excel/Sheets) or PDF (print view → "Save as PDF")
 - Deadline per item, with overdue / due-soon highlighting and overdue counts per list
 - Reminders (at deadline, 15 min / 1 h / 1 day / 1 week before, or a custom time):
   - in-app reminder banner with Open / Snooze 1h / Done / Dismiss
   - system notifications, including when the app is closed (Web Push)
+
+## Project layout
+
+```
+server.js            Express API, SQLite schema/migrations, reminders job, Web Push, live events
+public/index.html    App shell
+public/js/           Front-end ES modules (no build step)
+  app.js             entry: sign-in and start-up
+  core.js            helpers, state, people directory (names/avatars)
+  nav.js             sidebar + navigation between dashboard / list / search
+  list.js            list view: add form, to-dos, sub-tasks, comments, drag-to-reorder
+  dashboard.js       home screen      history.js   activity feed + dialog
+  search.js          search           sharing.js   share dialog
+  profile.js         profile dialog   reminders.js reminders + push
+  fields.js          shared form fields and chips
+  live.js            live updates     print.js     printable / PDF view
+public/sw.js         service worker for push notifications
+```
 
 ## Notifications & HTTPS
 
