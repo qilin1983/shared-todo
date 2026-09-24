@@ -427,6 +427,42 @@ const upload = multer({
   },
 });
 
+/** Identifies a supported image type from a file's leading bytes, or returns null. */
+function sniffImageType(buf) {
+  const ascii = (start, end) => buf.toString('latin1', start, end);
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
+  if (buf.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return 'image/png';
+  if (ascii(0, 6) === 'GIF87a' || ascii(0, 6) === 'GIF89a') return 'image/gif';
+  if (ascii(0, 4) === 'RIFF' && ascii(8, 12) === 'WEBP') return 'image/webp';
+  if (ascii(4, 8) === 'ftyp') {
+    const brand = ascii(8, 12);
+    if (['heic', 'heix', 'hevc', 'hevx', 'heim', 'heis'].includes(brand)) return 'image/heic';
+    if (['mif1', 'msf1', 'heif'].includes(brand)) return 'image/heif';
+  }
+  return null;
+}
+
+/**
+ * Checks uploaded files' actual bytes rather than trusting the client-declared type,
+ * and records the detected type so it's what we later serve as Content-Type.
+ */
+async function verifyImages(req, res, next) {
+  const files = req.files ?? (req.file ? [req.file] : []);
+  for (const f of files) {
+    const buf = Buffer.alloc(16);
+    const fh = await fs.promises.open(f.path, 'r');
+    try {
+      await fh.read(buf, 0, buf.length, 0);
+    } finally {
+      await fh.close();
+    }
+    const type = sniffImageType(buf);
+    if (!type) throw new HttpError(400, `"${f.originalname}" is not a supported image (JPEG, PNG, GIF, WebP, HEIC)`);
+    f.mimetype = type;
+  }
+  next();
+}
+
 function insertPhotos(itemId, files = []) {
   const stmt = db.prepare('INSERT INTO photos (item_id, filename, mime) VALUES (?, ?, ?)');
   for (const f of files) stmt.run(itemId, f.filename, f.mimetype);
@@ -750,7 +786,7 @@ const avatarUpload = multer({
   },
 });
 
-app.put('/api/me/avatar', requireAuth, avatarUpload.single('avatar'), (req, res) => {
+app.put('/api/me/avatar', requireAuth, avatarUpload.single('avatar'), verifyImages, (req, res) => {
   if (!req.file) throw new HttpError(400, 'No picture uploaded');
   const old = db.prepare('SELECT avatar_filename FROM users WHERE id = ?').get(req.user.id).avatar_filename;
   const version = Date.now();
@@ -1072,7 +1108,7 @@ app.get('/api/lists/:listId/export.csv', requireAuth, requireListAccess('view'),
 
 // ---- items
 
-app.post('/api/lists/:listId/items', requireAuth, requireListAccess('edit'), upload.array('photos', 10), (req, res) => {
+app.post('/api/lists/:listId/items', requireAuth, requireListAccess('edit'), upload.array('photos', 10), verifyImages, (req, res) => {
   const body = cleanText(req.body?.body ?? '', 20000, 'Text').trim();
   if (!body && !req.files?.length) throw new HttpError(400, 'Add some text or a photo');
   const dueAt = parseTime(req.body?.due_at, 'Deadline') ?? null;
@@ -1199,7 +1235,7 @@ app.delete('/api/items/:itemId', requireAuth, requireListAccess('edit'), (req, r
   res.status(204).end();
 });
 
-app.post('/api/items/:itemId/photos', requireAuth, requireListAccess('edit'), upload.array('photos', 10), (req, res) => {
+app.post('/api/items/:itemId/photos', requireAuth, requireListAccess('edit'), upload.array('photos', 10), verifyImages, (req, res) => {
   if (!req.files?.length) throw new HttpError(400, 'No photo uploaded');
   tx(() => {
     insertPhotos(req.item.id, req.files);
@@ -1418,6 +1454,7 @@ app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }));
 app.use((err, req, res, next) => {
   // Discard any files multer already wrote for a request that failed.
   if (req.files?.length) removeFiles(req.files.map((f) => f.filename));
+  if (req.file) removeFiles([req.file.filename]);
   if (err instanceof multer.MulterError) {
     const msg = err.code === 'LIMIT_FILE_SIZE' ? `Photos must be under ${MAX_PHOTO_BYTES / 1024 / 1024} MB` : err.message;
     return res.status(400).json({ error: msg });
