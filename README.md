@@ -18,6 +18,15 @@ phones on the same Wi-Fi can use those (allow Node through Windows Firewall if p
 
 Data (SQLite database, uploaded photos, push keys) lives in `./data`.
 
+## Tests
+
+```sh
+npm test                # API tests (node:test, no extra dependencies)
+npm run test:coverage   # same, with a coverage report for server.js
+```
+
+Each test file starts its own server on a free port with a throwaway `DATA_DIR`.
+
 ## Features
 
 - Accounts with username + password (scrypt hashed, HTTP-only session cookie, login throttling)

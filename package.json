@@ -6,7 +6,9 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "test": "node --test --test-force-exit test/*.test.js",
+    "test:coverage": "node --test --test-force-exit --experimental-test-coverage --test-coverage-include=server.js test/*.test.js"
   },
   "engines": {
     "node": ">=22.13"
